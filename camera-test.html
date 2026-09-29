@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Captiva camera test</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#fff;font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;background:#f4f5f7;color:#202124}
+  #start h1{font-size:20px;margin:0}
+  #start p{color:#5f6368;margin:0;max-width:340px}
+  #go{border:0;border-radius:12px;background:#1a73e8;color:#fff;font-size:18px;font-weight:600;padding:16px 32px}
+  #cam{position:fixed;inset:0;display:none}
+  #cam.show{display:block}
+  video{width:100%;height:100%;object-fit:cover;background:#000}
+  .top{position:absolute;top:0;left:0;right:0;padding:calc(12px + env(safe-area-inset-top)) 16px 12px;text-align:center;font-weight:600;background:linear-gradient(rgba(0,0,0,.6),transparent)}
+  .bot{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:space-between;padding:18px 22px calc(22px + env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(0,0,0,.6))}
+  #shutter{width:78px;height:78px;border-radius:50%;border:5px solid #fff;background:rgba(255,255,255,.25);padding:0}
+  #shutter:active{background:#fff}
+  #last{width:56px;height:56px;border-radius:8px;border:2px solid #fff;background:#333 center/cover no-repeat;display:flex;align-items:flex-end;justify-content:flex-end;padding:2px 4px;font-weight:700}
+  #done{height:48px;border-radius:24px;border:0;background:#fff;color:#000;font-weight:700;font-size:16px;padding:0 18px}
+  #flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .15s}
+  #result{display:none;position:fixed;inset:0;overflow:auto;background:#f4f5f7;color:#202124;padding:20px}
+  #result h1{font-size:20px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:6px}
+  .grid img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px}
+  .diag{font-size:12px;color:#5f6368;word-break:break-word;margin-top:16px}
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>Captiva camera test</h1>
+  <p>Tap the button, allow the camera, then tap the round shutter button as fast as you like. Nothing is uploaded or saved.</p>
+  <button id="go">Open camera</button>
+  <p id="msg"></p>
+</div>
+<div id="cam">
+  <video id="v" playsinline autoplay muted></video>
+  <div id="flash"></div>
+  <div class="top" id="count">0 photos</div>
+  <div class="bot"><div id="last"></div><button id="shutter" aria-label="Take photo"></button><button id="done">Done</button></div>
+</div>
+<div id="result"><h1 id="rt"></h1><div class="grid" id="grid"></div><p class="diag" id="diag"></p></div>
+<script>
+(function () {
+  var shots = [], stream = null, t0 = 0, info = [];
+  var $ = function (id) { return document.getElementById(id); };
+  function diag() {
+    return 'Browser: ' + navigator.userAgent + ' | ' + info.join(' | ');
+  }
+  $('go').onclick = function () {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { $('msg').textContent = 'Live camera NOT supported in this browser.'; info.push('no getUserMedia'); $('msg').textContent += ' ' + diag(); return; }
+    navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 4096 }, height: { ideal: 3072 } } })
+      .then(function (s) {
+        stream = s; var v = $('v'); v.srcObject = s; var p = v.play(); if (p && p.catch) p.catch(function () {});
+        $('start').style.display = 'none'; $('cam').classList.add('show');
+        v.onloadedmetadata = function () { info.push('camera ' + v.videoWidth + 'x' + v.videoHeight); };
+      })
+      .catch(function (e) { info.push('error ' + (e && e.name) + ': ' + (e && e.message)); $('msg').textContent = 'Live camera blocked (' + (e && e.name) + ').'; });
+  };
+  $('shutter').onclick = function () {
+    var v = $('v'); if (!v.videoWidth) return;
+    if (!t0) t0 = Date.now();
+    var f = $('flash'); f.style.opacity = '0.8'; setTimeout(function () { f.style.opacity = '0'; }, 90);
+    try { if (navigator.vibrate) navigator.vibrate(15); } catch (e) {}
+    var s = Math.min(1, 2048 / Math.max(v.videoWidth, v.videoHeight));
+    var c = document.createElement('canvas'); c.width = Math.round(v.videoWidth * s); c.height = Math.round(v.videoHeight * s);
+    c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+    var url = c.toDataURL('image/jpeg', 0.85);
+    shots.push({ url: url, w: c.width, h: c.height, kb: Math.round(url.length * 0.75 / 1024) });
+    $('last').style.backgroundImage = 'url(' + url + ')'; $('last').textContent = shots.length;
+    $('count').textContent = shots.length + ' photo' + (shots.length === 1 ? '' : 's');
+  };
+  $('done').onclick = function () {
+    if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+    $('cam').classList.remove('show'); $('result').style.display = 'block';
+    var secs = shots.length > 1 ? ((Date.now() - t0) / 1000).toFixed(1) : '0';
+    $('rt').textContent = 'Live camera works: ' + shots.length + ' photos' + (shots.length > 1 ? ' in about ' + secs + ' seconds' : '');
+    $('grid').innerHTML = shots.map(function (s) { return '<img src="' + s.url + '">'; }).join('');
+    if (shots.length) info.push('photo ' + shots[0].w + 'x' + shots[0].h + ', ~' + shots[0].kb + ' KB');
+    $('diag').textContent = diag();
+  };
+})();
+</script>
+</body>
+</html>
