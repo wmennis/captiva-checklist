@@ -85,7 +85,9 @@ var M = null;
   'use strict';
   var MAX_SIDE = 2048, QUALITY = 0.85, PARALLEL = 2, DRAFT_DELAY = 1200;
   var KEY = '';
-  var LINK = null, API = '';   // mode B: signed link + API address from the URL
+  var LINK = null, API = '';   // GitHub modes: link code + API address from the URL
+  var WHO = null;              // direct links: the person filling it out ({name, email})
+  var WHO_KEY = 'captiva-who';
   var state = { checked: {}, answers: {}, notes: '', photos: [], submitting: false, submitted: null };
   var camMode = 'unknown', camError = '', stream = null;
   var $ = function (id) { return document.getElementById(id); };
@@ -103,6 +105,8 @@ var M = null;
     });
   }
   function post(fn, args) {
+    args = args || {};
+    if (WHO) args.who = WHO.email;
     return fetch(API, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ fn: fn, k: LINK, args: args || {} }) })
       .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
       .then(function (j) { if (!j.ok) { var e = new Error(j.error || 'failed'); e.code = j.error; throw e; } return j.result; });
@@ -168,8 +172,10 @@ var M = null;
   function render() {
     if (state.submitted) return renderDone();
     var h = [];
+    var canChange = WHO && (M.people || []).length !== 1;
     h.push('<header><h1>' + esc(M.title) + '</h1><div class="sub">' + esc(M.job) + (M.community ? ' &middot; ' + esc(M.community) : '') +
-      (M.due ? ' &middot; Due ' + esc(fmtDate(M.due)) : '') + '</div><div class="bar"><i id="barFill"></i></div><div class="progress" id="prog"></div></header><main>');
+      (M.due ? ' &middot; Due ' + esc(fmtDate(M.due)) : '') +
+      (WHO ? ' &middot; ' + esc(WHO.name.split(' ')[0]) + (canChange ? ' <a href="#" id="changeWho" style="color:#1a73e8">change</a>' : '') : '') + '</div><div class="bar"><i id="barFill"></i></div><div class="progress" id="prog"></div></header><main>');
     M.sections.forEach(function (s, si) {
       h.push('<div class="card"><h2>' + esc(s.title) + (s.community ? ' <small>&middot; ' + esc(s.community) + ' only</small>' : '') + '</h2>');
       s.items.forEach(function (t, ti) {
@@ -198,6 +204,7 @@ var M = null;
     $('takeBtn').addEventListener('click', openCamera);
     $('libBtn').addEventListener('click', function () { $('fileLib').click(); });
     $('submitBtn').addEventListener('click', submit);
+    if ($('changeWho')) $('changeWho').addEventListener('click', function (e) { e.preventDefault(); pickWho(true, render); });
     renderPhotos(); renderStatus(); renderSaved();
   }
   function fmtDate(iso) { var p = String(iso).split('-'); return p.length === 3 ? (+p[1]) + '/' + (+p[2]) : iso; }
@@ -378,18 +385,47 @@ var M = null;
     if (M.closed) return renderMessage(M.pending ? 'Checklist submitted' : 'This checklist is closed', M.pending ? 'It is being filed in the job folder now.' : 'It has already been submitted or is no longer open.');
     if (M.pending) return renderMessage('Checklist submitted', 'It is being filed in the job folder now. You can close this page.');
     document.title = M.job + ' \u2014 ' + M.title;
+    if (LINK && !LINK.u && !WHO) return pickWho(false, start);
     var resumed = loadDraft();
     (M.staged || []).forEach(function (s) { state.photos.push({ clientId: s.clientId, id: s.id, takenAt: s.takenAt, status: 'saved', thumb: s.thumb || null }); });
     render();
     var n = (M.staged || []).length;
     if (resumed || n) { draftState = 'saved'; renderSaved(); toast('Picking up where you left off' + (n ? ' \u2014 ' + n + ' photo' + (n === 1 ? '' : 's') + ' already saved' : '') + '.', 3500); }
   }
+  // Who is filling this out (direct links only): the one assigned person automatically; otherwise the
+  // person this phone picked before (if they are allowed on this checklist); otherwise ask once.
+  function readWho() { try { return JSON.parse(localStorage.getItem(WHO_KEY) || 'null'); } catch (e) { return null; } }
+  function pickWho(force, then) {
+    var people = M.people || [], team = M.team || [], saved = readWho();
+    var has = function (list, w) { return !!w && list.some(function (x) { return x.email === w.email; }); };
+    if (!force) {
+      if (people.length === 1) { WHO = people[0]; return then(); }
+      if (saved && (people.length ? has(people, saved) : has(team, saved))) { WHO = saved; return then(); }
+    }
+    var first = people.length ? people : team;
+    var btn = function (x, i, list) { return '<button class="btn alt who" data-l="' + list + '" data-i="' + i + '" style="margin-top:10px;font-size:17px;padding:15px">' + esc(x.name) + '</button>'; };
+    $('app').innerHTML = '<div class="done-screen" style="padding-top:40px"><h1 style="font-size:21px;margin:0 0 6px">Who\u2019s filling this out?</h1>' +
+      '<p style="color:#5f6368;margin:0 0 14px">' + esc(M.job) + ' \u00b7 ' + esc(M.title) + '<br>This phone will remember your answer.</p>' +
+      first.map(function (x, i) { return btn(x, i, 'first'); }).join('') +
+      (people.length ? '<button class="btn alt" id="someoneElse" style="margin-top:18px;background:none">Someone else</button><div id="others" style="display:none">' +
+        team.filter(function (x) { return !has(people, x); }).map(function (x, i) { return btn(x, i, 'others'); }).join('') + '</div>' : '') + '</div>';
+    var lists = { first: first, others: team.filter(function (x) { return !has(people, x); }) };
+    Array.prototype.forEach.call(document.querySelectorAll('button.who'), function (b) {
+      b.addEventListener('click', function () {
+        WHO = lists[b.getAttribute('data-l')][+b.getAttribute('data-i')];
+        try { localStorage.setItem(WHO_KEY, JSON.stringify(WHO)); } catch (e) {}
+        then();
+      });
+    });
+    if ($('someoneElse')) $('someoneElse').addEventListener('click', function () { $('someoneElse').style.display = 'none'; $('others').style.display = 'block'; });
+  }
   var embedded = null;
   try { var raw = $('model').textContent.trim(); if (raw && raw.charAt(0) === '{') embedded = JSON.parse(raw); } catch (e) {}
   if (embedded) { M = embedded; start(); return; }
   // Mode B: signed link in the address → load the checklist from the API.
   var q = new URLSearchParams(location.search);
-  LINK = { t: q.get('t') || '', u: q.get('u') || '', x: q.get('x') || '', s: q.get('s') || '' };
+  LINK = { t: q.get('t') || '', s: q.get('s') || '' };
+  if (q.get('u') || q.get('x')) { LINK.u = q.get('u') || ''; LINK.x = q.get('x') || ''; }   // signed after Google sign-in
   var dep = q.get('a') || '';
   if (!/^rec[A-Za-z0-9]{14}$/.test(LINK.t) || !LINK.s || !/^[A-Za-z0-9_-]{20,120}$/.test(dep)) return renderMessage('Checklist link is incomplete', 'Go back to Airtable and tap Open checklist again.');
   API = 'https://script.google.com/macros/s/' + dep + '/exec';
