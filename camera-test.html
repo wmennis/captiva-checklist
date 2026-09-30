@@ -10,7 +10,7 @@
   #start h1{font-size:20px;margin:0}
   #start p{color:#5f6368;margin:0;max-width:340px}
   #go{border:0;border-radius:12px;background:#1a73e8;color:#fff;font-size:18px;font-weight:600;padding:16px 32px}
-  #cam{position:fixed;inset:0;display:none}
+  #cam{position:fixed;inset:0;display:none;overflow:hidden}
   #cam.show{display:block}
   video{width:100%;height:100%;object-fit:cover;background:#000}
   .top{position:absolute;top:0;left:0;right:0;padding:calc(12px + env(safe-area-inset-top)) 16px 12px;text-align:center;font-weight:600;background:linear-gradient(rgba(0,0,0,.6),transparent)}
@@ -19,6 +19,9 @@
   #shutter:active{background:#fff}
   #last{width:56px;height:56px;border-radius:8px;border:2px solid #fff;background:#333 center/cover no-repeat;display:flex;align-items:flex-end;justify-content:flex-end;padding:2px 4px;font-weight:700}
   #done{height:48px;border-radius:24px;border:0;background:#fff;color:#000;font-weight:700;font-size:16px;padding:0 18px}
+  #lensBar { position:absolute; left:0; right:0; bottom:calc(126px + env(safe-area-inset-bottom)); display:none; justify-content:center; align-items:center; gap:12px; pointer-events:none; }
+  #lensBar button { pointer-events:auto; width:44px; height:44px; border-radius:50%; border:0; background:rgba(0,0,0,.55); color:#fff; font-size:13px; font-weight:700; padding:0; }
+  #lensBar button.on { width:52px; height:52px; color:#ffd60a; font-size:16px; }
   #flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .15s}
   #result{display:none;position:fixed;inset:0;overflow:auto;background:#f4f5f7;color:#202124;padding:20px}
   #result h1{font-size:20px}
@@ -30,7 +33,7 @@
 <body>
 <div id="start">
   <h1>Captiva camera test</h1>
-  <p>Tap the button, allow the camera, then tap the round shutter button as fast as you like. Nothing is uploaded or saved.</p>
+  <p>Tap the button, allow the camera, then try the .5 / 1 / 2 lens buttons above the shutter and take a few photos with each. Nothing is uploaded or saved.</p>
   <button id="go">Open camera</button>
   <p id="msg"></p>
 </div>
@@ -38,6 +41,7 @@
   <video id="v" playsinline autoplay muted></video>
   <div id="flash"></div>
   <div class="top" id="count">0 photos</div>
+  <div id="lensBar"></div>
   <div class="bot"><div id="last"></div><button id="shutter" aria-label="Take photo"></button><button id="done">Done</button></div>
 </div>
 <div id="result"><h1 id="rt"></h1><div class="grid" id="grid"></div><p class="diag" id="diag"></p></div>
@@ -48,12 +52,101 @@
   function diag() {
     return 'Browser: ' + navigator.userAgent + ' | ' + info.join(' | ');
   }
+  // ---------- lens picker (.5x ultra wide / 1x / 2x) ----------
+  // iPhones list each back lens as its own camera once the camera is allowed.
+  // .5x = the Ultra Wide lens; 1x = the main lens; 2x = centre crop of the main lens.
+  var LENS_KEY = 'captiva-lens';
+  var lens = { cur: '1', mainId: '', ultraId: '', busy: false, labels: '' };
+  function savedLens() { try { return localStorage.getItem(LENS_KEY) || '1'; } catch (e) { return '1'; } }
+  function saveLens(z) { try { localStorage.setItem(LENS_KEY, z); } catch (e) {} }
+  function camConstraints(id) {
+    var v = { width: { ideal: 4096 }, height: { ideal: 3072 } };
+    if (id) v.deviceId = { exact: id }; else v.facingMode = { ideal: 'environment' };
+    return { audio: false, video: v };
+  }
+  function startId() {
+    var want = savedLens();
+    return (want === '0.5' && lens.ultraId) ? lens.ultraId : (lens.mainId || null);
+  }
+  function trackId() {
+    var t = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+    return t && t.getSettings ? (t.getSettings().deviceId || '') : '';
+  }
+  function camShowing() { return $('cam').classList.contains('show'); }
+  function findLenses() {
+    if (!navigator.mediaDevices.enumerateDevices) { if (!lens.mainId) lens.mainId = trackId(); return Promise.resolve(); }
+    return navigator.mediaDevices.enumerateDevices().then(function (ds) {
+      var main = '', ultra = '', names = [];
+      ds.forEach(function (d) {
+        var l = d.label || '';
+        if (d.kind !== 'videoinput') return;
+        names.push(l || '?');
+        if (!l || /front|frontal|delantera|facetime/i.test(l)) return;
+        if (/ultra/i.test(l)) { if (!ultra) ultra = d.deviceId; return; }
+        if (/tele|dual|doble|dupla|triple|tripla|triplo/i.test(l)) return;
+        if (!main) main = d.deviceId;
+      });
+      lens.ultraId = ultra;
+      lens.mainId = main || lens.mainId || trackId();
+      lens.labels = names.join(', ');
+    }).catch(function () { if (!lens.mainId) lens.mainId = trackId(); });
+  }
+  function paintLens() {
+    var bar = $('lensBar'), v = $('v');
+    v.style.transform = lens.cur === '2' ? 'scale(2)' : '';
+    if (!bar) return;
+    var opts = lens.ultraId ? ['0.5', '1', '2'] : ['1', '2'];
+    bar.innerHTML = opts.map(function (z) {
+      var on = z === lens.cur, txt = (z === '0.5' ? '.5' : z) + (on ? '×' : '');
+      return '<button type="button" data-z="' + z + '"' + (on ? ' class="on"' : '') + ' aria-label="' + z + 'x lens">' + txt + '</button>';
+    }).join('');
+    bar.style.display = stream ? 'flex' : 'none';
+  }
+  function setLens(z, force) {
+    if (lens.busy || !stream) return;
+    if (z === lens.cur && !force) return;
+    if (z === '0.5' && !lens.ultraId) z = '1';
+    var id = z === '0.5' ? lens.ultraId : lens.mainId;
+    saveLens(z);
+    if (!id || id === trackId()) { lens.cur = z; paintLens(); return; }
+    lens.busy = true;
+    var v = $('v');
+    stream.getTracks().forEach(function (t) { t.stop(); });   // iPhone runs one camera at a time
+    navigator.mediaDevices.getUserMedia(camConstraints(id)).then(null, function () {
+      z = '1'; return navigator.mediaDevices.getUserMedia(camConstraints(lens.mainId || null));
+    }).then(function (s) {
+      lens.busy = false;
+      if (!camShowing()) { s.getTracks().forEach(function (t) { t.stop(); }); stream = null; return; }
+      stream = s; v.srcObject = s; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
+      lens.cur = z; paintLens();
+    }).catch(function (e) { lens.busy = false; stream = null; paintLens(); lensFail(e); });
+  }
+  /** Call once the live camera is showing: learn the lenses and open the one used last time. */
+  function afterOpen() {
+    findLenses().then(function () {
+      if (!stream) return;
+      var want = savedLens();
+      if (want === '0.5' && !lens.ultraId) want = '1';
+      var need = want === '0.5' ? lens.ultraId : lens.mainId;
+      if (need && need !== trackId()) setLens(want, true); else { lens.cur = want; paintLens(); }
+    });
+  }
+  (function () {
+    var bar = $('lensBar');
+    if (bar) bar.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button') : null;
+      if (b) setLens(b.getAttribute('data-z'));
+    });
+  })();
+
+  function lensFail(e) { info.push('lens switch failed ' + (e && e.name)); $('count').textContent = 'Lens switch failed (' + (e && e.name) + ')'; }
+
   $('go').onclick = function () {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { $('msg').textContent = 'Live camera NOT supported in this browser.'; info.push('no getUserMedia'); $('msg').textContent += ' ' + diag(); return; }
-    navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 4096 }, height: { ideal: 3072 } } })
+    navigator.mediaDevices.getUserMedia(camConstraints(startId()))
       .then(function (s) {
         stream = s; var v = $('v'); v.srcObject = s; var p = v.play(); if (p && p.catch) p.catch(function () {});
-        $('start').style.display = 'none'; $('cam').classList.add('show');
+        $('start').style.display = 'none'; $('cam').classList.add('show'); afterOpen();
         v.onloadedmetadata = function () { info.push('camera ' + v.videoWidth + 'x' + v.videoHeight); };
       })
       .catch(function (e) { info.push('error ' + (e && e.name) + ': ' + (e && e.message)); $('msg').textContent = 'Live camera blocked (' + (e && e.name) + ').'; });
@@ -63,11 +156,12 @@
     if (!t0) t0 = Date.now();
     var f = $('flash'); f.style.opacity = '0.8'; setTimeout(function () { f.style.opacity = '0'; }, 90);
     try { if (navigator.vibrate) navigator.vibrate(15); } catch (e) {}
-    var s = Math.min(1, 2048 / Math.max(v.videoWidth, v.videoHeight));
-    var c = document.createElement('canvas'); c.width = Math.round(v.videoWidth * s); c.height = Math.round(v.videoHeight * s);
-    c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+    var z = lens.cur === '2' ? 2 : 1, sw = v.videoWidth / z, sh = v.videoHeight / z;
+    var s = Math.min(1, 2048 / Math.max(sw, sh));
+    var c = document.createElement('canvas'); c.width = Math.round(sw * s); c.height = Math.round(sh * s);
+    c.getContext('2d').drawImage(v, (v.videoWidth - sw) / 2, (v.videoHeight - sh) / 2, sw, sh, 0, 0, c.width, c.height);
     var url = c.toDataURL('image/jpeg', 0.85);
-    shots.push({ url: url, w: c.width, h: c.height, kb: Math.round(url.length * 0.75 / 1024) });
+    shots.push({ url: url, w: c.width, h: c.height, kb: Math.round(url.length * 0.75 / 1024), lens: lens.cur, cam: v.videoWidth + 'x' + v.videoHeight });
     $('last').style.backgroundImage = 'url(' + url + ')'; $('last').textContent = shots.length;
     $('count').textContent = shots.length + ' photo' + (shots.length === 1 ? '' : 's');
   };
@@ -76,8 +170,11 @@
     $('cam').classList.remove('show'); $('result').style.display = 'block';
     var secs = shots.length > 1 ? ((Date.now() - t0) / 1000).toFixed(1) : '0';
     $('rt').textContent = 'Live camera works: ' + shots.length + ' photos' + (shots.length > 1 ? ' in about ' + secs + ' seconds' : '');
-    $('grid').innerHTML = shots.map(function (s) { return '<img src="' + s.url + '">'; }).join('');
-    if (shots.length) info.push('photo ' + shots[0].w + 'x' + shots[0].h + ', ~' + shots[0].kb + ' KB');
+    $('grid').innerHTML = shots.map(function (s) { return '<img src="' + s.url + '" title="' + s.lens + 'x">'; }).join('');
+    info.push('cameras found: ' + (lens.labels || 'none listed'));
+    info.push(lens.ultraId ? 'ultra wide: YES' : 'ultra wide: NOT found');
+    var seen = {};
+    shots.forEach(function (x) { if (!seen[x.lens]) { seen[x.lens] = 1; info.push(x.lens + 'x photo ' + x.w + 'x' + x.h + ' (camera ' + x.cam + '), ~' + x.kb + ' KB'); } });
     $('diag').textContent = diag();
   };
 })();
