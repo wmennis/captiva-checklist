@@ -45,7 +45,7 @@
   footer .note { font-size:13px; color:var(--mute); text-align:center; margin-bottom:6px; min-height:16px; }
   .diag { font-size:11px; color:#9aa0a6; text-align:center; margin:18px 0 0; word-break:break-word; }
   /* camera overlay */
-  #cam { position:fixed; inset:0; z-index:20; background:#000; display:none; flex-direction:column; }
+  #cam { position:fixed; inset:0; z-index:20; background:#000; display:none; flex-direction:column; overflow:hidden; }
   #cam.show { display:flex; }
   #cam video { flex:1; width:100%; height:100%; object-fit:cover; background:#000; }
   #cam .top { position:absolute; top:0; left:0; right:0; padding:calc(12px + env(safe-area-inset-top)) 16px 12px; color:#fff; font-size:16px; font-weight:600; text-align:center; background:linear-gradient(rgba(0,0,0,.55),transparent); }
@@ -54,6 +54,9 @@
   #shutter:active { background:#fff; }
   #camLast { width:56px; height:56px; border-radius:8px; border:2px solid #fff; background:#333 center/cover no-repeat; color:#fff; font-weight:700; display:flex; align-items:flex-end; justify-content:flex-end; padding:2px 4px; font-size:14px; }
   #camDone { min-width:72px; height:48px; border-radius:24px; border:0; background:#fff; color:#000; font-weight:700; font-size:16px; padding:0 16px; }
+  #lensBar { position:absolute; left:0; right:0; bottom:calc(126px + env(safe-area-inset-bottom)); display:none; justify-content:center; align-items:center; gap:12px; pointer-events:none; }
+  #lensBar button { pointer-events:auto; width:44px; height:44px; border-radius:50%; border:0; background:rgba(0,0,0,.55); color:#fff; font-size:13px; font-weight:700; padding:0; }
+  #lensBar button.on { width:52px; height:52px; color:#ffd60a; font-size:16px; }
   #flash { position:absolute; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity .15s; }
   .done-screen { text-align:center; padding:56px 20px; }
   .done-screen .tick { width:72px; height:72px; border-radius:50%; background:var(--ok); margin:0 auto 16px; position:relative; }
@@ -67,6 +70,7 @@
   <video id="camVideo" playsinline autoplay muted></video>
   <div id="flash"></div>
   <div class="top" id="camTitle">Photo 1</div>
+  <div id="lensBar"></div>
   <div class="bot">
     <div id="camLast"></div>
     <button id="shutter" aria-label="Take photo"></button>
@@ -236,7 +240,7 @@ var M = null;
     else if (c.failed) note = c.failed + ' photo' + (c.failed === 1 ? '' : 's') + ' did not upload — tap it to retry';
     if ($('footNote')) $('footNote').textContent = note;
     if ($('submitBtn')) { $('submitBtn').disabled = state.submitting || c.pending > 0 || c.failed > 0; $('submitBtn').textContent = state.submitting ? 'Submitting…' : 'Submit checklist'; }
-    if ($('diag')) $('diag').textContent = 'Camera: ' + camMode + (camError ? ' (' + camError + ')' : '') + ' · ' + (M.code || '') + ' · ' + M.taskId;
+    if ($('diag')) $('diag').textContent = 'Camera: ' + camMode + (camError ? ' (' + camError + ')' : '') + (camMode === 'live' ? ' · lens ' + lens.cur + 'x' + (lens.ultraId ? '' : ' (no ultra wide found)') : '') + ' · ' + (M.code || '') + ' · ' + M.taskId;
     if ($('camTitle')) $('camTitle').textContent = ph;
   }
   function renderDone() {
@@ -275,10 +279,12 @@ var M = null;
     renderPhotos(); renderStatus();
   }
   /** Draw a video frame or image into a JPEG no larger than MAX_SIDE; returns {data, thumb}. */
-  function encode(src, w, h) {
-    var s = Math.min(1, MAX_SIDE / Math.max(w, h));
-    var c = document.createElement('canvas'); c.width = Math.round(w * s); c.height = Math.round(h * s);
-    c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+  function encode(src, w, h, zoom) {
+    zoom = zoom || 1;   // 2 = centre crop (the 2x lens button)
+    var sw = w / zoom, sh = h / zoom;
+    var s = Math.min(1, MAX_SIDE / Math.max(sw, sh));
+    var c = document.createElement('canvas'); c.width = Math.round(sw * s); c.height = Math.round(sh * s);
+    c.getContext('2d').drawImage(src, (w - sw) / 2, (h - sh) / 2, sw, sh, 0, 0, c.width, c.height);
     var data = c.toDataURL('image/jpeg', QUALITY);
     var ts = 180 / Math.max(c.width, c.height), t = document.createElement('canvas');
     t.width = Math.round(c.width * ts); t.height = Math.round(c.height * ts);
@@ -286,15 +292,104 @@ var M = null;
     return { data: data, thumb: t.toDataURL('image/jpeg', 0.7) };
   }
 
+  // ---------- lens picker (.5x ultra wide / 1x / 2x) ----------
+  // iPhones list each back lens as its own camera once the camera is allowed.
+  // .5x = the Ultra Wide lens; 1x = the main lens; 2x = centre crop of the main lens.
+  var LENS_KEY = 'captiva-lens';
+  var lens = { cur: '1', mainId: '', ultraId: '', busy: false, labels: '' };
+  function savedLens() { try { return localStorage.getItem(LENS_KEY) || '1'; } catch (e) { return '1'; } }
+  function saveLens(z) { try { localStorage.setItem(LENS_KEY, z); } catch (e) {} }
+  function camConstraints(id) {
+    var v = { width: { ideal: 4096 }, height: { ideal: 3072 } };
+    if (id) v.deviceId = { exact: id }; else v.facingMode = { ideal: 'environment' };
+    return { audio: false, video: v };
+  }
+  function startId() {
+    var want = savedLens();
+    return (want === '0.5' && lens.ultraId) ? lens.ultraId : (lens.mainId || null);
+  }
+  function trackId() {
+    var t = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
+    return t && t.getSettings ? (t.getSettings().deviceId || '') : '';
+  }
+  function camShowing() { return $('cam').classList.contains('show'); }
+  function findLenses() {
+    if (!navigator.mediaDevices.enumerateDevices) { if (!lens.mainId) lens.mainId = trackId(); return Promise.resolve(); }
+    return navigator.mediaDevices.enumerateDevices().then(function (ds) {
+      var main = '', ultra = '', names = [];
+      ds.forEach(function (d) {
+        var l = d.label || '';
+        if (d.kind !== 'videoinput') return;
+        names.push(l || '?');
+        if (!l || /front|frontal|delantera|facetime/i.test(l)) return;
+        if (/ultra/i.test(l)) { if (!ultra) ultra = d.deviceId; return; }
+        if (/tele|dual|doble|dupla|triple|tripla|triplo/i.test(l)) return;
+        if (!main) main = d.deviceId;
+      });
+      lens.ultraId = ultra;
+      lens.mainId = main || lens.mainId || trackId();
+      lens.labels = names.join(', ');
+    }).catch(function () { if (!lens.mainId) lens.mainId = trackId(); });
+  }
+  function paintLens() {
+    var bar = $('lensBar'), v = $('camVideo');
+    v.style.transform = lens.cur === '2' ? 'scale(2)' : '';
+    if (!bar) return;
+    var opts = lens.ultraId ? ['0.5', '1', '2'] : ['1', '2'];
+    bar.innerHTML = opts.map(function (z) {
+      var on = z === lens.cur, txt = (z === '0.5' ? '.5' : z) + (on ? '×' : '');
+      return '<button type="button" data-z="' + z + '"' + (on ? ' class="on"' : '') + ' aria-label="' + z + 'x lens">' + txt + '</button>';
+    }).join('');
+    bar.style.display = stream ? 'flex' : 'none';
+  }
+  function setLens(z, force) {
+    if (lens.busy || !stream) return;
+    if (z === lens.cur && !force) return;
+    if (z === '0.5' && !lens.ultraId) z = '1';
+    var id = z === '0.5' ? lens.ultraId : lens.mainId;
+    saveLens(z);
+    if (!id || id === trackId()) { lens.cur = z; paintLens(); return; }
+    lens.busy = true;
+    var v = $('camVideo');
+    stream.getTracks().forEach(function (t) { t.stop(); });   // iPhone runs one camera at a time
+    navigator.mediaDevices.getUserMedia(camConstraints(id)).then(null, function () {
+      z = '1'; return navigator.mediaDevices.getUserMedia(camConstraints(lens.mainId || null));
+    }).then(function (s) {
+      lens.busy = false;
+      if (!camShowing()) { s.getTracks().forEach(function (t) { t.stop(); }); stream = null; return; }
+      stream = s; v.srcObject = s; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
+      lens.cur = z; paintLens();
+    }).catch(function (e) { lens.busy = false; stream = null; paintLens(); lensFail(e); });
+  }
+  /** Call once the live camera is showing: learn the lenses and open the one used last time. */
+  function afterOpen() {
+    findLenses().then(function () {
+      if (!stream) return;
+      var want = savedLens();
+      if (want === '0.5' && !lens.ultraId) want = '1';
+      var need = want === '0.5' ? lens.ultraId : lens.mainId;
+      if (need && need !== trackId()) setLens(want, true); else { lens.cur = want; paintLens(); }
+    });
+  }
+  (function () {
+    var bar = $('lensBar');
+    if (bar) bar.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button') : null;
+      if (b) setLens(b.getAttribute('data-z'));
+    });
+  })();
+
+  function lensFail(e) { closeCamera(); fallback((e && e.name) || 'lens switch failed'); }
+
   // ---------- live camera (one tap per photo) ----------
   function openCamera() {
     if (camMode === 'phone camera') return $('fileCam').click();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { fallback('not supported here'); return; }
-    navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 4096 }, height: { ideal: 3072 } } })
+    navigator.mediaDevices.getUserMedia(camConstraints(startId()))
       .then(function (s) {
         stream = s; camMode = 'live'; camError = '';
         var v = $('camVideo'); v.srcObject = s; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
-        $('cam').classList.add('show'); renderStatus(); updateLast();
+        $('cam').classList.add('show'); renderStatus(); updateLast(); afterOpen();
       })
       .catch(function (e) { fallback((e && e.name) || 'blocked'); });
   }
@@ -313,7 +408,7 @@ var M = null;
     if (!v.videoWidth) return;
     var f = $('flash'); f.style.opacity = '0.8'; setTimeout(function () { f.style.opacity = '0'; }, 90);
     try { if (navigator.vibrate) navigator.vibrate(15); } catch (e) {}
-    var out = encode(v, v.videoWidth, v.videoHeight);
+    var out = encode(v, v.videoWidth, v.videoHeight, lens.cur === '2' ? 2 : 1);
     addPhoto(out.data, out.thumb, new Date().toISOString());
     updateLast();
   }
