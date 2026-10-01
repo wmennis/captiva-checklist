@@ -295,18 +295,20 @@ var M = null;
   // ---------- lens picker (.5x ultra wide / 1x / 2x) ----------
   // iPhones list each back lens as its own camera once the camera is allowed.
   // .5x = the Ultra Wide lens; 1x = the main lens; 2x = centre crop of the main lens.
+  // The camera ALWAYS opens on 1x; the lens is not remembered (10/1: a remembered .5x opened black on
+  // Nathan's iPhone 17 Pro Max). The old saved setting is cleared from phones that have it.
   var LENS_KEY = 'captiva-lens';
-  var lens = { cur: '1', mainId: '', ultraId: '', busy: false, labels: '' };
-  function savedLens() { try { return localStorage.getItem(LENS_KEY) || '1'; } catch (e) { return '1'; } }
-  function saveLens(z) { try { localStorage.setItem(LENS_KEY, z); } catch (e) {} }
+  try { localStorage.removeItem(LENS_KEY); } catch (e) {}
+  var lens = { cur: '1', mainId: '', ultraId: '', busy: false, labels: '', ultraBad: false };
+  function savedLens() { return '1'; }
+  function saveLens(z) {}
   function camConstraints(id) {
     var v = { width: { ideal: 4096 }, height: { ideal: 3072 } };
     if (id) v.deviceId = { exact: id }; else v.facingMode = { ideal: 'environment' };
     return { audio: false, video: v };
   }
   function startId() {
-    var want = savedLens();
-    return (want === '0.5' && lens.ultraId) ? lens.ultraId : (lens.mainId || null);
+    return (lens.cur === '0.5' && lens.ultraId) ? lens.ultraId : (lens.mainId || null);
   }
   function trackId() {
     var t = stream && stream.getVideoTracks && stream.getVideoTracks()[0];
@@ -326,7 +328,7 @@ var M = null;
         if (/tele|dual|doble|dupla|triple|tripla|triplo/i.test(l)) return;
         if (!main) main = d.deviceId;
       });
-      lens.ultraId = ultra;
+      lens.ultraId = lens.ultraBad ? '' : ultra;
       lens.mainId = main || lens.mainId || trackId();
       lens.labels = names.join(', ');
     }).catch(function () { if (!lens.mainId) lens.mainId = trackId(); });
@@ -359,6 +361,7 @@ var M = null;
       if (!camShowing()) { s.getTracks().forEach(function (t) { t.stop(); }); stream = null; return; }
       useStream(s);
       lens.cur = z; paintLens();
+      if (z === '0.5') checkPicture(s);
     }).catch(function (e) { lens.busy = false; stream = null; paintLens(); lensFail(e); });
   }
   /** Call once the live camera is showing: learn the lenses and open the one used last time. */
@@ -378,6 +381,29 @@ var M = null;
       if (b) setLens(b.getAttribute('data-z'));
     });
   })();
+
+
+  /** After switching to .5x: if the picture is black or not moving after 2 s, go back to 1x and hide .5x
+      for the rest of this visit (some iPhones give the page a black ultra-wide feed). */
+  function checkPicture(s) {
+    var v = $('camVideo'), t0 = v.currentTime;
+    setTimeout(function () {
+      if (stream !== s || !camShowing() || lens.cur !== '0.5' || lens.busy) return;
+      if (v.videoWidth && v.currentTime !== t0 && !isBlack(v)) return;
+      lens.ultraBad = true; lens.ultraId = '';
+      toast('The .5x lens isn’t working on this phone — back to 1x.', 3500);
+      setLens('1', true);
+    }, 2000);
+  }
+  function isBlack(v) {
+    try {
+      var c = document.createElement('canvas'); c.width = 32; c.height = 24;
+      var g = c.getContext('2d'); g.drawImage(v, 0, 0, 32, 24);
+      var d = g.getImageData(0, 0, 32, 24).data, max = 0, sum = 0;
+      for (var i = 0; i < d.length; i += 4) { var y = (d[i] * 3 + d[i + 1] * 6 + d[i + 2]) / 10; sum += y; if (y > max) max = y; }
+      return max < 24 && sum / (d.length / 4) < 8;
+    } catch (e) { return false; }
+  }
 
   function lensFail(e) { closeCamera(); fallback((e && e.name) || 'lens switch failed'); }
 
@@ -423,6 +449,7 @@ var M = null;
     if (cam.restarts >= 2) { closeCamera(); fallback('camera stopped: ' + why); return; }
     cam.restarts++; cam.restarting = true; cam.stall = 0; cam.healthy = 0;
     if (!quiet) toast('Restarting camera…', 1500);
+    if (lens.cur === '0.5') lens.cur = '1';   // restart on the main lens, the safe one
     releaseStream();
     navigator.mediaDevices.getUserMedia(camConstraints(startId())).then(function (s) {
       cam.restarting = false;
@@ -442,7 +469,7 @@ var M = null;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { fallback('not supported here'); return; }
     navigator.mediaDevices.getUserMedia(camConstraints(startId()))
       .then(function (s) {
-        camMode = 'live'; camError = ''; cam.restarts = 0;
+        camMode = 'live'; camError = ''; cam.restarts = 0; lens.cur = '1';
         $('cam').classList.add('show'); useStream(s); startWatch();
         renderStatus(); updateLast(); afterOpen();
       })
