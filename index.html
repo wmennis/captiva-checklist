@@ -229,6 +229,12 @@ var M = null;
     Array.prototype.forEach.call(g.querySelectorAll('.x'), function (b) { b.addEventListener('click', function (e) { e.stopPropagation(); removePhoto(+b.getAttribute('data-x')); }); });
     Array.prototype.forEach.call(g.querySelectorAll('.th'), function (el) { el.addEventListener('click', function () { var p = state.photos[+el.getAttribute('data-i')]; if (p && p.status === 'failed') { p.status = 'queued'; p.tries = 0; pump(); renderPhotos(); renderStatus(); } }); });
   }
+  function camInfo() {
+    try {
+      var v = $('camVideo'), t = stream && stream.getVideoTracks()[0];
+      return (v && v.videoWidth ? ' · ' + v.videoWidth + '×' + v.videoHeight : '') + (t && t.label ? ' · ' + t.label : '');
+    } catch (e) { return ''; }
+  }
   function renderStatus() {
     var c = counts();
     var pct = c.total ? Math.round(100 * c.done / c.total) : 100;
@@ -240,7 +246,7 @@ var M = null;
     else if (c.failed) note = c.failed + ' photo' + (c.failed === 1 ? '' : 's') + ' did not upload — tap it to retry';
     if ($('footNote')) $('footNote').textContent = note;
     if ($('submitBtn')) { $('submitBtn').disabled = state.submitting || c.pending > 0 || c.failed > 0; $('submitBtn').textContent = state.submitting ? 'Submitting…' : 'Submit checklist'; }
-    if ($('diag')) $('diag').textContent = 'Camera: ' + camMode + (camError ? ' (' + camError + ')' : '') + (camMode === 'live' ? ' · lens ' + lens.cur + 'x' + (lens.ultraId ? '' : ' (no ultra wide found)') : '') + ' · ' + (M.code || '') + ' · ' + M.taskId;
+    if ($('diag')) $('diag').textContent = 'Camera: ' + camMode + (camError ? ' (' + camError + ')' : '') + (camMode === 'live' ? ' · lens ' + lens.cur + 'x' + (lens.ultraId ? '' : ' (no ultra wide found)') : '') + ' · tier ' + camTier + camInfo() + ' · ' + (M.code || '') + ' · ' + M.taskId;
     if ($('camTitle')) $('camTitle').textContent = ph;
   }
   function renderDone() {
@@ -302,9 +308,15 @@ var M = null;
   var lens = { cur: '1', mainId: '', ultraId: '', busy: false, labels: '', ultraBad: false };
   function savedLens() { return '1'; }
   function saveLens(z) {}
+  // Camera "tier": 0 = full resolution, 1 = 1920 wide, 2 = plain back camera (no size, no lens pick),
+  // 3 = the phone's own camera app. If the live picture is black/frozen the page steps down a tier.
+  // The working tier is remembered on the phone for 7 days (it's about the phone, not a choice).
+  var TIER_KEY = 'captiva-cam-tier', camTier = 0;
+  try { var tk = JSON.parse(localStorage.getItem(TIER_KEY) || 'null'); if (tk && Date.now() - tk.at < 7 * 864e5) camTier = tk.tier | 0; } catch (e) {}
+  function saveTier() { try { localStorage.setItem(TIER_KEY, JSON.stringify({ tier: camTier, at: Date.now() })); } catch (e) {} }
   function camConstraints(id) {
-    var v = { width: { ideal: 4096 }, height: { ideal: 3072 } };
-    if (id) v.deviceId = { exact: id }; else v.facingMode = { ideal: 'environment' };
+    var v = camTier === 0 ? { width: { ideal: 4096 }, height: { ideal: 3072 } } : camTier === 1 ? { width: { ideal: 1920 }, height: { ideal: 1440 } } : {};
+    if (id && camTier < 2) v.deviceId = { exact: id }; else v.facingMode = { ideal: 'environment' };
     return { audio: false, video: v };
   }
   function startId() {
@@ -328,7 +340,7 @@ var M = null;
         if (/tele|dual|doble|dupla|triple|tripla|triplo/i.test(l)) return;
         if (!main) main = d.deviceId;
       });
-      lens.ultraId = lens.ultraBad ? '' : ultra;
+      lens.ultraId = (lens.ultraBad || camTier >= 2) ? '' : ultra;
       lens.mainId = main || lens.mainId || trackId();
       lens.labels = names.join(', ');
     }).catch(function () { if (!lens.mainId) lens.mainId = trackId(); });
@@ -361,13 +373,14 @@ var M = null;
       if (!camShowing()) { s.getTracks().forEach(function (t) { t.stop(); }); stream = null; return; }
       useStream(s);
       lens.cur = z; paintLens();
-      if (z === '0.5') checkPicture(s);
+      if (z === '0.5') checkPicture(s); else checkOpen(s);
     }).catch(function (e) { lens.busy = false; stream = null; paintLens(); lensFail(e); });
   }
   /** Call once the live camera is showing: learn the lenses and open the one used last time. */
   function afterOpen() {
     findLenses().then(function () {
       if (!stream) return;
+      if (camTier >= 2) { lens.cur = '1'; paintLens(); return; }
       var want = savedLens();
       if (want === '0.5' && !lens.ultraId) want = '1';
       var need = want === '0.5' ? lens.ultraId : lens.mainId;
@@ -403,6 +416,31 @@ var M = null;
       for (var i = 0; i < d.length; i += 4) { var y = (d[i] * 3 + d[i + 1] * 6 + d[i + 2]) / 10; sum += y; if (y > max) max = y; }
       return max < 24 && sum / (d.length / 4) < 8;
     } catch (e) { return false; }
+  }
+
+
+  /** ~2.5 s after the camera opens: if the picture is black, frozen or has no size, step down a tier
+      and reopen; past tier 2, close the live camera and use the phone's own camera. */
+  function checkOpen(s) {
+    var v = $('camVideo'), t0 = -1;
+    setTimeout(function () { if (stream === s) t0 = v.currentTime; }, 800);
+    setTimeout(function () {
+      if (!camShowing() || lens.busy || cam.restarting || document.hidden) return;
+      if (stream && stream !== s) return;                       // lens switch/restart took over
+      var ok = stream === s && v.videoWidth && v.currentTime !== t0 && !isBlack(v);
+      if (ok) { saveTier(); renderStatus(); return; }
+      camTier++; saveTier();
+      if (camTier >= 3) {
+        closeCamera(); camMode = 'phone camera'; camError = 'live picture black'; renderStatus();
+        toast('The live camera shows black on this phone. Tap Take photos again to use your phone’s camera.', 5000);
+        return;
+      }
+      lens.cur = '1'; releaseStream();
+      navigator.mediaDevices.getUserMedia(camConstraints(lens.mainId || null)).then(function (s2) {
+        if (!camShowing() || document.hidden) { s2.getTracks().forEach(function (t) { t.stop(); }); return; }
+        useStream(s2); paintLens(); renderStatus(); checkOpen(s2);
+      }).catch(function (e) { closeCamera(); fallback((e && e.name) || 'reopen failed'); });
+    }, 2500);
   }
 
   function lensFail(e) { closeCamera(); fallback((e && e.name) || 'lens switch failed'); }
@@ -454,7 +492,7 @@ var M = null;
     navigator.mediaDevices.getUserMedia(camConstraints(startId())).then(function (s) {
       cam.restarting = false;
       if (!camShowing() || document.hidden) { s.getTracks().forEach(function (t) { t.stop(); }); return; }
-      useStream(s); paintLens();
+      useStream(s); paintLens(); checkOpen(s);
     }).catch(function (e) { cam.restarting = false; closeCamera(); fallback((e && e.name) || 'restart failed'); });
   }
   function camHidden() { if (camShowing()) { releaseStream(); cam.restarting = false; } }
@@ -465,13 +503,13 @@ var M = null;
 
   // ---------- live camera (one tap per photo) ----------
   function openCamera() {
-    if (camMode === 'phone camera') return $('fileCam').click();
+    if (camMode === 'phone camera' || camTier >= 3) { camMode = 'phone camera'; renderStatus(); return $('fileCam').click(); }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { fallback('not supported here'); return; }
     navigator.mediaDevices.getUserMedia(camConstraints(startId()))
       .then(function (s) {
         camMode = 'live'; camError = ''; cam.restarts = 0; lens.cur = '1';
         $('cam').classList.add('show'); useStream(s); startWatch();
-        renderStatus(); updateLast(); afterOpen();
+        renderStatus(); updateLast(); afterOpen(); checkOpen(s);
       })
       .catch(function (e) { fallback((e && e.name) || 'blocked'); });
   }
