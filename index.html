@@ -357,7 +357,7 @@ var M = null;
     }).then(function (s) {
       lens.busy = false;
       if (!camShowing()) { s.getTracks().forEach(function (t) { t.stop(); }); stream = null; return; }
-      stream = s; v.srcObject = s; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
+      useStream(s);
       lens.cur = z; paintLens();
     }).catch(function (e) { lens.busy = false; stream = null; paintLens(); lensFail(e); });
   }
@@ -381,15 +381,70 @@ var M = null;
 
   function lensFail(e) { closeCamera(); fallback((e && e.name) || 'lens switch failed'); }
 
+
+  // ---------- camera health ----------
+  // iPhones cut a web page's camera when the page is hidden: screen lock, switching apps, a call, a
+  // notification opened, or another tab/app taking the camera. The track then ends or goes "muted" and
+  // the camera screen would sit on a black picture. So: let go of the camera while hidden, start it again
+  // on return, restart it if it dies while showing, and after 2 failed restarts fall back to the
+  // phone's own camera instead of leaving a black screen.
+  var cam = { watch: null, restarts: 0, restarting: false, lastT: -1, seenMotion: false, stall: 0, healthy: 0 };
+  function trackLive() {
+    var t = stream && stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
+    return !!(t && t.readyState === 'live' && !t.muted);
+  }
+  function useStream(s) {
+    stream = s; cam.lastT = -1; cam.seenMotion = false; cam.stall = 0;
+    var v = $('camVideo'); v.srcObject = s; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
+    s.getVideoTracks().forEach(function (t) {
+      t.addEventListener('ended', function () { if (stream === s && !lens.busy) restartCamera('ended'); });
+    });
+  }
+  function startWatch() {
+    stopWatch();
+    cam.watch = setInterval(function () {
+      if (!camShowing() || lens.busy || cam.restarting || document.hidden || !stream) return;
+      var v = $('camVideo'), t = v.currentTime;
+      var moving = v.readyState >= 2 && cam.lastT >= 0 && t !== cam.lastT;
+      cam.lastT = t;
+      if (moving) cam.seenMotion = true;
+      // Frozen only counts once we've seen this browser's picture move (so a browser that never
+      // advances currentTime can't trigger restarts); a muted/ended track always counts.
+      var bad = !trackLive() || (cam.seenMotion && !moving);
+      if (!bad) { cam.stall = 0; if (moving && ++cam.healthy >= 2) cam.restarts = 0; return; }
+      cam.healthy = 0;
+      if (++cam.stall >= 3) restartCamera(trackLive() ? 'frozen' : 'muted');
+    }, 1000);
+  }
+  function stopWatch() { if (cam.watch) clearInterval(cam.watch); cam.watch = null; cam.stall = 0; cam.healthy = 0; }
+  function releaseStream() { if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; } }
+  function restartCamera(why, quiet) {
+    if (!camShowing() || cam.restarting || document.hidden) return;
+    if (cam.restarts >= 2) { closeCamera(); fallback('camera stopped: ' + why); return; }
+    cam.restarts++; cam.restarting = true; cam.stall = 0; cam.healthy = 0;
+    if (!quiet) toast('Restarting camera…', 1500);
+    releaseStream();
+    navigator.mediaDevices.getUserMedia(camConstraints(startId())).then(function (s) {
+      cam.restarting = false;
+      if (!camShowing() || document.hidden) { s.getTracks().forEach(function (t) { t.stop(); }); return; }
+      useStream(s); paintLens();
+    }).catch(function (e) { cam.restarting = false; closeCamera(); fallback((e && e.name) || 'restart failed'); });
+  }
+  function camHidden() { if (camShowing()) { releaseStream(); cam.restarting = false; } }
+  function camShown() { if (camShowing() && !stream) { cam.restarts = 0; restartCamera('resume', true); } }
+  document.addEventListener('visibilitychange', function () { if (document.hidden) camHidden(); else camShown(); });
+  window.addEventListener('pagehide', camHidden);
+  window.addEventListener('pageshow', function () { if (!document.hidden) camShown(); });
+
   // ---------- live camera (one tap per photo) ----------
   function openCamera() {
     if (camMode === 'phone camera') return $('fileCam').click();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { fallback('not supported here'); return; }
     navigator.mediaDevices.getUserMedia(camConstraints(startId()))
       .then(function (s) {
-        stream = s; camMode = 'live'; camError = '';
-        var v = $('camVideo'); v.srcObject = s; var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
-        $('cam').classList.add('show'); renderStatus(); updateLast(); afterOpen();
+        camMode = 'live'; camError = ''; cam.restarts = 0;
+        $('cam').classList.add('show'); useStream(s); startWatch();
+        renderStatus(); updateLast(); afterOpen();
       })
       .catch(function (e) { fallback((e && e.name) || 'blocked'); });
   }
@@ -399,12 +454,14 @@ var M = null;
     toast('Live camera isn’t available here. Tap Take photos again to use your phone’s camera.', 4500);
   }
   function closeCamera() {
+    stopWatch(); cam.restarting = false;
     $('cam').classList.remove('show');
     if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
     renderStatus();
   }
   function shoot() {
     var v = $('camVideo');
+    if (!trackLive()) { restartCamera('dead at shutter'); return; }   // never save a black frame
     if (!v.videoWidth) return;
     var f = $('flash'); f.style.opacity = '0.8'; setTimeout(function () { f.style.opacity = '0'; }, 90);
     try { if (navigator.vibrate) navigator.vibrate(15); } catch (e) {}
